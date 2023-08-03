@@ -11,7 +11,9 @@
 -}
 
 module Text.DocTemplates.Parser
-    ( compileTemplate ) where
+    ( compileTemplate
+    , compileTemplate'
+    ) where
 
 import Data.Char (isAlphaNum)
 import Control.Monad (guard, when)
@@ -34,9 +36,18 @@ import Data.Semigroup ((<>), Semigroup)
 -- | Compile a template.  The FilePath parameter is used
 -- to determine a default path and extension for partials
 -- and may be left empty if partials are not used.
+-- The delimiter used is '$'.
 compileTemplate :: (TemplateMonad m, TemplateTarget a)
                 => FilePath -> Text -> m (Either String (Template a))
-compileTemplate templPath template = do
+compileTemplate templPath template = compileTemplate' templPath template '$'
+
+-- | Compile a template using the given delimiter.
+-- The FilePath parameter is used to determine a default
+-- and extension for partials and may be left empty if
+-- partials are not used.
+compileTemplate' :: (TemplateMonad m, TemplateTarget a)
+                => FilePath -> Text -> Char -> m (Either String (Template a))
+compileTemplate' templPath template delimiter = do
   res <- P.runParserT (pTemplate <* P.eof)
            PState{ templatePath    = templPath
                  , partialNesting  = 1
@@ -44,6 +55,7 @@ compileTemplate templPath template = do
                  , firstNonspace   = P.initialPos templPath
                  , nestedCol       = Nothing
                  , insideDirective = False
+                 , delimiter       = delimiter
                  } templPath template
   case res of
        Left e   -> return $ Left $ show e
@@ -57,6 +69,7 @@ data PState =
          , firstNonspace   :: P.SourcePos
          , nestedCol       :: Maybe Int
          , insideDirective :: Bool
+         , delimiter       :: Char
          }
 
 type Parser = P.ParsecT Text PState
@@ -101,7 +114,8 @@ pNewline = P.try $ do
 
 pLit :: (TemplateTarget a, Monad m) => Parser m (Template a)
 pLit = do
-  cs <- P.many1 (P.satisfy (\c -> c /= '$' && c /= '\n' && c /= '\r'))
+  d <- delimiter <$> P.getState
+  cs <- P.many1 (P.satisfy (\c -> c /= d && c /= '\n' && c /= '\r'))
   when (all (\c -> c == ' ' || c == '\t') cs) $ do
      pos <- P.getPosition
      when (P.sourceLine pos == 1) $
@@ -134,7 +148,9 @@ backupSourcePos n = do
   P.setPosition $ P.incSourceColumn pos (- n)
 
 pEscape :: (TemplateTarget a, Monad m) => Parser m (Template a)
-pEscape = Literal "$" <$ P.try (P.string "$$" <* backupSourcePos 1)
+pEscape = do
+  d <- delimiter <$> P.getState
+  Literal (DL.text [d]) <$ P.try (P.string (replicate 2 d) <* backupSourcePos 1)
 
 pDirective :: (TemplateTarget a, TemplateMonad m)
            => Parser m (Template a)
@@ -352,25 +368,26 @@ pSpaceOrTab = P.satisfy (\c -> c == ' ' || c == '\t')
 
 pComment :: Monad m => Parser m ()
 pComment = do
+  d <- delimiter <$> P.getState
   pos <- P.getPosition
-  P.try (P.string "$--")
+  P.try (P.string (d:"--"))
   P.skipMany (P.satisfy (/='\n'))
   -- If the comment begins in the first column, the line ending
   -- will be consumed; otherwise not.
   when (P.sourceColumn pos == 1) $ () <$ pNewlineOrEof
 
 pOpenDollar :: Monad m => Parser m (Parser m ())
-pOpenDollar =
-  pCloseDollar <$ P.try (P.char '$' <*
-                   P.notFollowedBy (P.char '$' <|> P.char '{'))
-  where
-   pCloseDollar = () <$ P.char '$'
+pOpenDollar = do
+  d <- delimiter <$> P.getState
+  let pCloseDollar = () <$ P.char d
+  pCloseDollar <$ P.try (P.char d <*
+                   P.notFollowedBy (P.char d <|> P.char '{'))
 
 pOpenBraces :: Monad m => Parser m (Parser m ())
-pOpenBraces =
-  pCloseBraces <$ P.try (P.string "${" <* P.notFollowedBy (P.char '}'))
-  where
-   pCloseBraces = () <$ P.try (P.char '}')
+pOpenBraces = do
+  d <- delimiter <$> P.getState
+  let pCloseBraces = () <$ P.try (P.char '}')
+  pCloseBraces <$ P.try (P.string (d:"{") <* P.notFollowedBy (P.char '}'))
 
 pOpen :: Monad m => Parser m (Parser m ())
 pOpen = pOpenDollar <|> pOpenBraces
